@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+*.xcodeproj
+.DS_Store
+
+walkthrough-recorder/node_modules/
+*.mov
+walkthrough-recorder/scrawl-mouse
+*.mp4
