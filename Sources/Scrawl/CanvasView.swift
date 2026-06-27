@@ -6,6 +6,9 @@ struct Stroke {
     var width: CGFloat
     var points: [NSPoint]
     var bornAt: Date? = nil
+    // Monotonic creation order, shared with Shape, so undo can remove the most
+    // recently committed item regardless of which collection it lives in.
+    var seq: Int = 0
 }
 
 // Programmatic annotation kinds (driven by the control server / an agent).
@@ -22,6 +25,12 @@ struct Shape {
     var width: CGFloat
     var text: String? = nil
     var bornAt: Date? = nil
+    var seq: Int = 0
+}
+
+// Human toolbar drawing tools. Default = pen (freehand).
+enum DrawTool {
+    case pen, line, rect, ellipse
 }
 
 final class CanvasView: NSView {
@@ -29,8 +38,20 @@ final class CanvasView: NSView {
     private(set) var shapes: [Shape] = []
     private var current: Stroke?
 
+    // In-progress shape (rubber-band preview) while dragging line/rect/ellipse.
+    private var previewShape: Shape?
+    private var dragStart: NSPoint?
+
+    // Monotonic counter assigned to every committed stroke/shape so undo can
+    // pop whichever was added most recently.
+    private var seqCounter = 0
+    private func nextSeq() -> Int { seqCounter += 1; return seqCounter }
+
     var strokeColor: NSColor = .systemRed
     var strokeWidth: CGFloat = 4
+
+    // Active human drawing tool (set from the toolbar). Default = freehand pen.
+    var currentTool: DrawTool = .pen
 
     var showActiveBorder = false { didSet { needsDisplay = true } }
 
@@ -76,6 +97,8 @@ final class CanvasView: NSView {
     // MARK: Programmatic API (used by the control server)
 
     func addShape(_ s: Shape) {
+        var s = s
+        s.seq = nextSeq()
         shapes.append(s)
         if s.bornAt != nil { startFadeTimer() }
         needsDisplay = true
@@ -89,36 +112,134 @@ final class CanvasView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        current = Stroke(color: strokeColor, width: strokeWidth, points: [p])
+        dragStart = p
+        switch currentTool {
+        case .pen:
+            current = Stroke(color: strokeColor, width: strokeWidth, points: [p])
+        case .line, .rect, .ellipse:
+            previewShape = Shape(kind: toolShapeKind, points: [p, p],
+                                 color: strokeColor, width: strokeWidth)
+        }
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard current != nil else { return }
-        current?.points.append(convert(event.locationInWindow, from: nil))
+        let p = convert(event.locationInWindow, from: nil)
+        let shift = event.modifierFlags.contains(.shift)
+        switch currentTool {
+        case .pen:
+            guard current != nil, let start = dragStart else { return }
+            if shift {
+                // Shift constrains the pen to a straight, angle-snapped line.
+                current?.points = [start, constrain(start, p)]
+            } else {
+                current?.points.append(p)
+            }
+        case .line:
+            guard let start = dragStart else { return }
+            previewShape?.points = [start, shift ? constrain(start, p) : p]
+        case .rect, .ellipse:
+            guard let start = dragStart else { return }
+            previewShape?.points = [start, shift ? square(start, p) : p]
+        }
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
-        if var c = current, c.points.count > 0 {
-            if fadeEnabled { c.bornAt = Date(); startFadeTimer() }
-            strokes.append(c)
+        let p = convert(event.locationInWindow, from: nil)
+        let shift = event.modifierFlags.contains(.shift)
+        switch currentTool {
+        case .pen:
+            if var c = current, !c.points.isEmpty {
+                if shift, let start = dragStart { c.points = [start, constrain(start, p)] }
+                if fadeEnabled { c.bornAt = Date(); startFadeTimer() }
+                c.seq = nextSeq()
+                strokes.append(c)
+            }
+        case .line, .rect, .ellipse:
+            if let start = dragStart {
+                let end: NSPoint
+                switch currentTool {
+                case .rect, .ellipse: end = shift ? square(start, p) : p
+                default: end = shift ? constrain(start, p) : p
+                }
+                // Ignore zero-size click-drags.
+                if abs(end.x - start.x) > 1 || abs(end.y - start.y) > 1 {
+                    var s = Shape(kind: toolShapeKind, points: [start, end],
+                                  color: strokeColor, width: strokeWidth)
+                    if fadeEnabled { s.bornAt = Date(); startFadeTimer() }
+                    s.seq = nextSeq()
+                    shapes.append(s)
+                }
+            }
         }
         current = nil
+        previewShape = nil
+        dragStart = nil
         needsDisplay = true
+    }
+
+    private var toolShapeKind: ShapeKind {
+        switch currentTool {
+        case .line: return .line
+        case .rect: return .rect
+        case .ellipse: return .ellipse
+        case .pen: return .freehand
+        }
+    }
+
+    /// Snap the segment from `from` to `to` to the nearest 45° increment,
+    /// preserving length — used for Shift-straight lines.
+    private func constrain(_ from: NSPoint, _ to: NSPoint) -> NSPoint {
+        let dx = to.x - from.x, dy = to.y - from.y
+        let dist = hypot(dx, dy)
+        if dist == 0 { return to }
+        let step = CGFloat.pi / 4
+        let angle = (atan2(dy, dx) / step).rounded() * step
+        return NSPoint(x: from.x + cos(angle) * dist, y: from.y + sin(angle) * dist)
+    }
+
+    /// Constrain a bounding box to a square (equal sides) — Shift on rect/ellipse.
+    private func square(_ from: NSPoint, _ to: NSPoint) -> NSPoint {
+        let dx = to.x - from.x, dy = to.y - from.y
+        let side = max(abs(dx), abs(dy))
+        return NSPoint(x: from.x + (dx < 0 ? -side : side),
+                       y: from.y + (dy < 0 ? -side : side))
     }
 
     func clearAll() {
         strokes.removeAll()
         shapes.removeAll()
         current = nil
+        previewShape = nil
+        dragStart = nil
         needsDisplay = true
     }
 
     func undo() {
-        guard !strokes.isEmpty else { return }
-        strokes.removeLast()
+        let lastStroke = strokes.last?.seq ?? -1
+        let lastShape = shapes.last?.seq ?? -1
+        if lastStroke < 0 && lastShape < 0 { return }
+        if lastStroke >= lastShape {
+            strokes.removeLast()
+        } else {
+            shapes.removeLast()
+        }
         needsDisplay = true
+    }
+
+    // MARK: Snapshot
+
+    /// Render the current ink (strokes + shapes, no active border) to a
+    /// transparent PNG. Needs no permission.
+    func snapshotPNG() -> Data? {
+        let savedBorder = showActiveBorder
+        showActiveBorder = false
+        defer { showActiveBorder = savedBorder; needsDisplay = true }
+        guard let rep = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        rep.size = bounds.size
+        cacheDisplay(in: bounds, to: rep)
+        return rep.representation(using: .png, properties: [:])
     }
 
     // MARK: Rendering
@@ -130,6 +251,7 @@ final class CanvasView: NSView {
         for s in strokes { renderStroke(s) }
         if let c = current { renderStroke(c) }
         for sh in shapes { renderShape(sh) }
+        if let pv = previewShape { renderShape(pv) }
 
         if showActiveBorder {
             let frame = NSBezierPath(rect: bounds.insetBy(dx: 2, dy: 2))
