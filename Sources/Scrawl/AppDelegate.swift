@@ -10,23 +10,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var toggleButton: NSButton!
     private var fadeButton: NSButton!
     private var collapseButton: NSButton!
+    private var saveButton: NSButton!
     private var toolbarStack: NSStackView!
     private var dragHandle: DragHandle!
     private var collapsibleViews: [NSView] = []
     private var isCollapsed = false
     private var swatchButtons: [NSButton] = []
+    private var toolButtons: [NSButton] = []
+
+    // Toolbar hide/show (menu-bar driven). We remember the last frame so the
+    // bar reappears exactly where the user left it.
+    private var toolbarHidden = false
+    private var savedToolbarFrame: NSRect?
+
+    // Menu-bar menu (popped manually so a click can also restore the toolbar).
+    private var statusMenu: NSMenu?
+
+    // Configurable shortcuts (loaded from ~/.scrawl/shortcuts.json).
+    private var shortcuts: [String: Shortcut] = [:]
+    private var prefsController: PreferencesWindowController?
+
+    // Default tool tags for the toolbar tool buttons.
+    private let toolForTag: [Int: DrawTool] = [0: .pen, 1: .line, 2: .rect, 3: .ellipse]
 
     // Draw mode = overlay captures the mouse. Ghost mode = clicks pass through.
     private var isDrawing = false {
         didSet { applyMode() }
     }
 
-    // Control+Option key combos (ANSI virtual key codes).
-    private let kToggle: UInt16 = 2 // D
-    private let kClear: UInt16 = 8  // C
-    private let kUndo: UInt16 = 6   // Z
-
     func applicationDidFinishLaunching(_ notification: Notification) {
+        shortcuts = ShortcutConfig.load()
         setupOverlay()
         setupToolbar()
         setupStatusItem()
@@ -79,6 +92,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         stack.addArrangedSubview(separator())
 
+        // Tool selector: Pen / Line / Rect / Ellipse (default = Pen).
+        let tools: [(Int, String, String)] = [
+            (0, "✎", "Pen (freehand) — hold Shift for a straight line"),
+            (1, "╱", "Line — drag start→end (Shift snaps angle)"),
+            (2, "▭", "Rectangle — drag corner to corner (Shift = square)"),
+            (3, "◯", "Ellipse — drag corner to corner (Shift = circle)")
+        ]
+        for (tag, title, tip) in tools {
+            let b = NSButton(title: title, target: self, action: #selector(selectTool(_:)))
+            b.bezelStyle = .rounded
+            b.tag = tag
+            b.toolTip = tip
+            toolButtons.append(b)
+            stack.addArrangedSubview(b)
+        }
+        highlightTool(0)
+
+        stack.addArrangedSubview(separator())
+
         let colors: [(String, NSColor)] = [
             ("red", .systemRed), ("blue", .systemBlue), ("green", .systemGreen),
             ("yellow", .systemYellow), ("black", .black), ("white", .white)
@@ -107,6 +139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stack.addArrangedSubview(fadeButton)
 
         stack.addArrangedSubview(separator())
+
+        stack.addArrangedSubview(separator())
+
+        saveButton = NSButton(title: "📷 Save", target: self, action: #selector(saveSnapshot))
+        saveButton.bezelStyle = .rounded
+        saveButton.toolTip = "Save the canvas to ~/Pictures/Scrawl/ (transparent PNG; flattens with background if Screen Recording is allowed)."
+        stack.addArrangedSubview(saveButton)
 
         let undo = NSButton(title: "Undo", target: self, action: #selector(undoStroke))
         undo.bezelStyle = .rounded
@@ -195,17 +234,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "✏️"
+        // Action-based (no attached .menu) so a click can RESTORE a hidden
+        // toolbar; when the toolbar is visible the click pops the menu instead.
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusItemClicked)
+        rebuildStatusMenu()
+    }
 
+    /// Build (or rebuild, after a shortcut change) the menu-bar menu with
+    /// current shortcut hints in the titles.
+    private func rebuildStatusMenu() {
+        func desc(_ action: String) -> String {
+            guard let sc = shortcuts[action] else { return "" }
+            return " (\(sc.describe()))"
+        }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Toggle Drawing (⌃⌥D)", action: #selector(toggleMode), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Undo (⌃⌥Z)", action: #selector(undoStroke), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Clear (⌃⌥C)", action: #selector(clearCanvas), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Toggle Fade Mode", action: #selector(toggleFade), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Toggle Drawing\(desc("toggleDraw"))", action: #selector(toggleMode), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Undo\(desc("undo"))", action: #selector(undoStroke), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Clear\(desc("clear"))", action: #selector(clearCanvas), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Toggle Fade Mode\(desc("toggleFade"))", action: #selector(toggleFade), keyEquivalent: ""))
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Show/Hide Toolbar", action: #selector(toggleToolbar), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Tool: Pen\(desc("toolPen"))", action: #selector(toolPenMenu), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Tool: Line\(desc("toolLine"))", action: #selector(toolLineMenu), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Tool: Rectangle\(desc("toolRect"))", action: #selector(toolRectMenu), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Tool: Ellipse\(desc("toolEllipse"))", action: #selector(toolEllipseMenu), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Save Snapshot\(desc("snapshot"))", action: #selector(saveSnapshot), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: toolbarHidden ? "Show Toolbar\(desc("toggleToolbar"))" : "Hide Toolbar\(desc("toggleToolbar"))", action: #selector(toggleToolbar), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Scrawl", action: #selector(quit), keyEquivalent: "q"))
-        statusItem.menu = menu
+        statusMenu = menu
+    }
+
+    /// A click on the menu-bar item restores a hidden toolbar; otherwise it
+    /// pops the menu.
+    @objc private func statusItemClicked() {
+        if toolbarHidden {
+            showToolbar()
+        } else if let button = statusItem.button, let menu = statusMenu {
+            menu.popUp(positioning: nil,
+                       at: NSPoint(x: 0, y: button.bounds.height + 4),
+                       in: button)
+        }
     }
 
     // MARK: - Hotkeys (Control+Option + key)
@@ -224,18 +295,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @discardableResult
     private func handleHotkey(_ event: NSEvent) -> Bool {
-        // Escape always leaves drawing mode — no modifier required.
+        // Escape always leaves drawing mode — no modifier required, not bindable.
         if event.keyCode == 53 { // Esc
             if isDrawing { isDrawing = false; return true }
             return false
         }
-        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard mods == [.control, .option] else { return false }
-        switch event.keyCode {
-        case kToggle: toggleMode(); return true
-        case kClear: clearCanvas(); return true
-        case kUndo: undoStroke(); return true
-        default: return false
+        for (action, sc) in shortcuts where sc.matches(event) {
+            performAction(action)
+            return true
+        }
+        return false
+    }
+
+    /// Dispatch a bindable action by name (shared by hotkeys + menu).
+    private func performAction(_ action: String) {
+        switch action {
+        case "toggleDraw": toggleMode()
+        case "undo": undoStroke()
+        case "clear": clearCanvas()
+        case "toggleFade": toggleFade()
+        case "toggleToolbar": toggleToolbar()
+        case "snapshot": saveSnapshot()
+        case "toolPen": setTool(.pen)
+        case "toolLine": setTool(.line)
+        case "toolRect": setTool(.rect)
+        case "toolEllipse": setTool(.ellipse)
+        default: break
         }
     }
 
@@ -292,7 +377,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func undoStroke() { canvas.undo() }
     @objc private func clearCanvas() { canvas.clearAll() }
-    @objc private func toggleToolbar() { toolbar.isVisible ? toolbar.orderOut(nil) : toolbar.orderFrontRegardless() }
+
+    // MARK: - Tool selection
+
+    @objc private func selectTool(_ sender: NSButton) {
+        guard let tool = toolForTag[sender.tag] else { return }
+        setTool(tool)
+    }
+
+    private func setTool(_ tool: DrawTool) {
+        canvas.currentTool = tool
+        let tag = toolForTag.first(where: { $0.value == tool })?.key ?? 0
+        highlightTool(tag)
+    }
+
+    private func highlightTool(_ tag: Int) {
+        for b in toolButtons {
+            b.contentTintColor = (b.tag == tag) ? .controlAccentColor : nil
+            b.font = (b.tag == tag) ? .boldSystemFont(ofSize: NSFont.systemFontSize)
+                                    : .systemFont(ofSize: NSFont.systemFontSize)
+        }
+    }
+
+    // Menu-bar tool entries (the toolbar buttons use selectTool(_:)).
+    @objc private func toolPenMenu() { setTool(.pen) }
+    @objc private func toolLineMenu() { setTool(.line) }
+    @objc private func toolRectMenu() { setTool(.rect) }
+    @objc private func toolEllipseMenu() { setTool(.ellipse) }
+
+    // MARK: - Toolbar hide / show
+
+    @objc private func toggleToolbar() { toolbarHidden ? showToolbar() : hideToolbar() }
+
+    private func hideToolbar() {
+        savedToolbarFrame = toolbar.frame
+        toolbar.orderOut(nil)
+        toolbarHidden = true
+        rebuildStatusMenu()
+    }
+
+    private func showToolbar() {
+        if let f = savedToolbarFrame { toolbar.setFrame(f, display: false) }
+        toolbar.orderFrontRegardless()
+        toolbarHidden = false
+        rebuildStatusMenu()
+    }
+
+    // MARK: - Snapshot / export
+
+    @objc private func saveSnapshot() {
+        guard let png = canvas.snapshotPNG() else {
+            flashSaveButton("Save failed")
+            NSLog("Scrawl: snapshot render failed")
+            return
+        }
+        // Best-effort flatten-with-background; always falls back to drawing-only.
+        SnapshotExporter.saveFlattened(inkPNG: png) { [weak self] result in
+            switch result {
+            case .savedDrawingOnly(let url):
+                self?.flashSaveButton("Saved ✓")
+                NSLog("Scrawl: saved drawing-only PNG → \(url.path)")
+            case .savedFlattened(let url):
+                self?.flashSaveButton("Saved ✓")
+                NSLog("Scrawl: saved flattened PNG → \(url.path)")
+            case .failed(let why):
+                self?.flashSaveButton("Save failed")
+                NSLog("Scrawl: snapshot failed — \(why)")
+            }
+        }
+    }
+
+    /// Brief toolbar feedback after a save.
+    private func flashSaveButton(_ text: String) {
+        guard let btn = saveButton else { return }
+        let original = "📷 Save"
+        btn.title = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak btn] in
+            btn?.title = original
+        }
+    }
+
+    // MARK: - Preferences
+
+    @objc private func openPreferences() {
+        let controller = PreferencesWindowController(shortcuts: shortcuts) { [weak self] updated in
+            guard let self = self else { return }
+            self.shortcuts = updated          // monitors read this live = re-registered
+            self.rebuildStatusMenu()
+        }
+        prefsController = controller
+        controller.show()
+    }
+
     @objc private func quit() { NSApplication.shared.terminate(nil) }
 
     // MARK: - Control server (loopback HTTP, agent-drivable)
